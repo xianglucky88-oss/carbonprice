@@ -115,14 +115,33 @@ def parse(resp_body, fmt):
     raise ValueError("unknown fmt: %s" % fmt)
 
 
+#: A failing page is skipped (and reported) instead of aborting the run;
+#: give up only after this many consecutive failures.
+MAX_PAGE_FAILURES = 3
+
+
 def fetch_all(http: Http):
-    """Collect records from the local source."""
-    records, attempts, page = [], 0, 1
+    """Collect records from the local source.
+
+    Returns ``(records, attempts, page_errors)``.  A page that fails after
+    retries does not hold back the good pages: it is skipped, reported in
+    ``page_errors``, and the caller must treat any reported error as a
+    reason not to advance the watermark past records it never saw.
+    """
+    records, attempts, errors = [], 0, []
+    page = 1
+    failures_in_a_row = 0
     while True:
         status, _hdr, body, att = http.get("/" + SPEC.endpoint, params={"page": page})
         attempts += att + 1
         if status != 200:
-            raise RuntimeError("fetch failed status=%s page=%s" % (status, page))
+            errors.append({"page": page, "status": status})
+            failures_in_a_row += 1
+            page += 1
+            if failures_in_a_row >= MAX_PAGE_FAILURES or page > 200:
+                break
+            continue
+        failures_in_a_row = 0
         page_recs = parse(body, SPEC.fmt)
         records.extend(page_recs)
         if len(page_recs) < SPEC.page_size:
@@ -130,7 +149,7 @@ def fetch_all(http: Http):
         page += 1
         if page > 200:
             break
-    return records, attempts
+    return records, attempts, errors
 
 
 # --------------------------------------------------------------------------- #
@@ -165,12 +184,30 @@ def normalize(r):
 
 def _apply_kernel(records):
     k = importlib.import_module(".kernel", __package__)
+    out = []
     for r in records:
         if hasattr(k, "process"):
-            r.update(k.process(r))
+            try:
+                r.update(k.process(r))
+            except Exception as exc:  # one bad record must not sink the batch
+                r.update({
+                    "raw_value": None,
+                    "value_norm": None,
+                    "scale_factor": 1,
+                    "was_large": 0,
+                    "price_status": "abnormal",
+                    "price_flags": ["kernel_error"],
+                    "quarantined": True,
+                    "rationale": [
+                        "rule=isolation: kernel failed to interpret this "
+                        "record (%s); quarantined so good records are "
+                        "unaffected" % exc],
+                    "rules_version": getattr(k, "RULES_VERSION", "unknown"),
+                })
+        out.append(r)
     if hasattr(k, "reduce"):
-        records = k.reduce(records)
-    return records
+        out = k.reduce(out)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -183,7 +220,7 @@ def run(mode="full", con=None):
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
     try:
-        records, attempts = fetch_all(http)
+        records, attempts, page_errors = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
         norm = _apply_kernel(norm)
@@ -192,14 +229,28 @@ def run(mode="full", con=None):
         if mode == "incremental" and wm:
             norm = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
+        ingested = 0
+        quarantined = 0
+        for r in norm:
+            if store.upsert(r):
+                ingested += 1
+            if r.get("quarantined"):
+                quarantined += 1
         total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
-        if new_wm:
-            store.set_watermark(new_wm)
+        # Progress is driven only by trustworthy records, and only when the
+        # fetch was complete: a quarantined record or a partial failure must
+        # never push the watermark past records we never saw.
+        if not page_errors:
+            good_ts = [str(r.get("ts", "")) for r in norm
+                       if not r.get("quarantined")]
+            new_wm = max(good_ts + [wm or ""])
+            if new_wm:
+                store.set_watermark(new_wm)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
-                "http_attempts": attempts, "slept": round(sleeper.slept, 4),
+                "duplicates": dup_in_batch, "ingested": ingested,
+                "quarantined": quarantined, "page_errors": page_errors,
+                "count": total, "http_attempts": attempts,
+                "slept": round(sleeper.slept, 4),
                 "watermark": store.watermark()}
     finally:
         if own:
@@ -285,6 +336,7 @@ def run_rpa(con=None):
         norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
         ingested = sum(1 for x in norm if store.upsert(x))
+        quarantined = sum(1 for x in norm if x.get("quarantined"))
         total = store.count()
         created = dedup_submit = 0
         for x in norm[:2]:
@@ -295,12 +347,13 @@ def run_rpa(con=None):
         for x in norm[:1]:
             if not r.submit(x):
                 dedup_submit += 1
-        wm = max([str(x.get("ts", "")) for x in norm] + [""])
+        good_ts = [str(x.get("ts", "")) for x in norm if not x.get("quarantined")]
+        wm = max(good_ts + [store.watermark() or ""])
         if wm:
             store.set_watermark(wm)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
-                "ingested": ingested, "count": total,
+                "ingested": ingested, "quarantined": quarantined, "count": total,
                 "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
     finally:
         if own:
